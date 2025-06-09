@@ -1,4 +1,9 @@
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
 import numpy as np
+import wave
+import soundfile as sf
 import pyaudio as pa
 import os, time
 import argparse
@@ -15,13 +20,91 @@ from torch.utils.data import DataLoader
 Module for streaming Japanese ASR using Nvidia Nemo QuartzNet.
 Encapsulated as ASRService with initialization and inference methods.
 """
+class FrameASR:
+    
+    def __init__(self, model, model_definition,
+                 frame_len=2, frame_overlap=2.5, 
+                 offset=10):
+        '''
+        Args:
+          frame_len: frame's duration, seconds
+          frame_overlap: duration of overlaps before and after current frame, seconds
+          offset: number of symbols to drop for smooth streaming
+        '''
+        # Store reference to the NeMo model
+        self.model = model
+        
+        self.vocab = list(model_definition['labels'])
+        self.vocab.append('_')
+        
+        self.sr = model_definition['sample_rate']
+        self.frame_len = frame_len
+        self.n_frame_len = int(frame_len * self.sr)
+        self.frame_overlap = frame_overlap
+        self.n_frame_overlap = int(frame_overlap * self.sr)
+        timestep_duration = model_definition['AudioToMelSpectrogramPreprocessor']['window_stride']
+        for block in model_definition['JasperEncoder']['jasper']:
+            timestep_duration *= block['stride'][0] ** block['repeat']
+        self.n_timesteps_overlap = int(frame_overlap / timestep_duration) - 2
+        self.buffer = np.zeros(shape=2*self.n_frame_overlap + self.n_frame_len,
+                               dtype=np.float32)
+        self.offset = offset
+        self.reset()
+        
+    def _decode(self, frame, offset=0):
+        assert len(frame)==self.n_frame_len
+        self.buffer[:-self.n_frame_len] = self.buffer[self.n_frame_len:]
+        self.buffer[-self.n_frame_len:] = frame
+        logits = infer_signal(self.model, self.buffer).cpu().numpy()[0]
 
+        # print(logits.shape)
+        decoded = self._greedy_decoder(
+            logits[self.n_timesteps_overlap:-self.n_timesteps_overlap], 
+            self.vocab
+        )
+        
+        return decoded[:len(decoded)-offset]
+    
+    @torch.no_grad()
+    def transcribe(self, frame=None, merge=True):
+        if frame is None:
+            frame = np.zeros(shape=self.n_frame_len, dtype=np.float32)
+        if len(frame) < self.n_frame_len:
+            frame = np.pad(frame, [0, self.n_frame_len - len(frame)], 'constant')
+        unmerged = self._decode(frame, self.offset)
+        if not merge:
+            return unmerged
+        return self.greedy_merge(unmerged)
+    
+    def reset(self):
+        '''
+        Reset frame_history and decoder's state
+        '''
+        self.buffer=np.zeros(shape=self.buffer.shape, dtype=np.float32)
+        self.prev_char = ''
+
+    @staticmethod
+    def _greedy_decoder(logits, vocab):
+        s = ''
+        for i in range(logits.shape[0]):
+            s += vocab[np.argmax(logits[i])]
+        return s
+
+    def greedy_merge(self, s):
+        s_merged = ''
+        
+        for i in range(len(s)):
+            if s[i] != self.prev_char:
+                self.prev_char = s[i]
+                if self.prev_char != '_':
+                    s_merged += self.prev_char
+        return s_merged
+    
 class ASRService:
     """ASR service encapsulating model initialization and streaming inference."""
-    def __init__(self, device=None, frame_len=2.0, frame_overlap=2.5, offset=4,
+    def __init__(self, frame_len=2.0, frame_overlap=2.5, offset=4,
                  model_path='./quartznet_jp/japanese-quartznet-large.nemo'):
         # Hidden initialization parameters
-        self.device = device
         self.frame_len = frame_len
         self.frame_overlap = frame_overlap
         self.offset = offset
@@ -96,20 +179,20 @@ class ASRService:
         )
         self.asr.reset()
 
-    def start_stream(self):
-        """Start PyAudio streaming and perform ASR."""
+    def _mic_frame_iterator(self, device=None):
         p = pa.PyAudio()
         # List devices
         devices = [i for i in range(p.get_device_count())
                    if p.get_device_info_by_index(i).get('maxInputChannels') > 0]
         for i in devices:
             print(i, p.get_device_info_by_index(i).get('name'))
-        dev_idx = self.device if self.device in devices else None
+        dev_idx = device if device in devices else None
         empty_counter = 0
 
         def callback(in_data, frame_count, time_info, status):
             nonlocal empty_counter
             frame = np.frombuffer(in_data, dtype=np.int16)
+            
             text = self.asr.transcribe(frame)
             if text:
                 print(text, end='', flush=True)
@@ -137,6 +220,41 @@ class ASRService:
             stream.close()
             p.terminate()
             print("\nStream stopped")
+
+    def start_stream(self, frame_iterator=None, device=None):
+        """
+        Stream from microphone or provided iterator with detailed debug logs.
+        """
+        # Determine frame iterator
+        if frame_iterator is None:
+            frame_iterator = self._mic_frame_iterator(device)
+
+        n = self.asr.n_frame_len
+        sr = self.sample_rate
+
+        print("Listening...")
+        for i, raw_frame in enumerate(frame_iterator):
+            # raw_frame is int16 numpy array of length n
+            if raw_frame.shape[0] < n:
+                raw_frame = np.pad(raw_frame, (0, n - raw_frame.shape[0]), 'constant')
+            float_frame = raw_frame.astype(np.float32) / 32768.0
+
+            # Debug logging
+            logging.debug(f"[MIC] Frame {i}: dtype={float_frame.dtype}, shape={float_frame.shape}, mean={float_frame.mean():.6f}, std={float_frame.std():.6f}")
+
+            # Transcribe both unmerged and merged
+            unmerged = self.asr.transcribe(float_frame, merge=False)
+            merged = self.asr.transcribe(float_frame, merge=True)
+            logging.debug(f"[MIC] Frame {i} Unmerged: '{unmerged}'")
+            logging.debug(f"[MIC] Frame {i} Merged:   '{merged}'")
+
+            # Print merged result
+            if merged:
+                print(merged, end='', flush=True)
+
+            # Maintain offset silence if needed
+            # Sleep to simulate real-time spacing
+            time.sleep(n / sr)
 
 # Data layer: wraps raw audio into a single-instance IterableDataset for inference
 # simple data layer to pass audio signal
@@ -198,87 +316,65 @@ def infer_signal(model, signal):
 # 1) use reset() method to reset FrameASR's state
 # 2) call transcribe(frame) to do ASR on
 #    contiguous signal's frames
-class FrameASR:
-    
-    def __init__(self, model, model_definition,
-                 frame_len=2, frame_overlap=2.5, 
-                 offset=10):
-        '''
-        Args:
-          frame_len: frame's duration, seconds
-          frame_overlap: duration of overlaps before and after current frame, seconds
-          offset: number of symbols to drop for smooth streaming
-        '''
-        # Store reference to the NeMo model
-        self.model = model
-        
-        self.vocab = list(model_definition['labels'])
-        self.vocab.append('_')
-        
-        self.sr = model_definition['sample_rate']
-        self.frame_len = frame_len
-        self.n_frame_len = int(frame_len * self.sr)
-        self.frame_overlap = frame_overlap
-        self.n_frame_overlap = int(frame_overlap * self.sr)
-        timestep_duration = model_definition['AudioToMelSpectrogramPreprocessor']['window_stride']
-        for block in model_definition['JasperEncoder']['jasper']:
-            timestep_duration *= block['stride'][0] ** block['repeat']
-        self.n_timesteps_overlap = int(frame_overlap / timestep_duration) - 2
-        self.buffer = np.zeros(shape=2*self.n_frame_overlap + self.n_frame_len,
-                               dtype=np.float32)
-        self.offset = offset
-        self.reset()
-        
-    def _decode(self, frame, offset=0):
-        assert len(frame)==self.n_frame_len
-        self.buffer[:-self.n_frame_len] = self.buffer[self.n_frame_len:]
-        self.buffer[-self.n_frame_len:] = frame
-        logits = infer_signal(self.model, self.buffer).cpu().numpy()[0]
-        # print(logits.shape)
-        decoded = self._greedy_decoder(
-            logits[self.n_timesteps_overlap:-self.n_timesteps_overlap], 
-            self.vocab
-        )
-        return decoded[:len(decoded)-offset]
-    
-    @torch.no_grad()
-    def transcribe(self, frame=None, merge=True):
-        if frame is None:
-            frame = np.zeros(shape=self.n_frame_len, dtype=np.float32)
-        if len(frame) < self.n_frame_len:
-            frame = np.pad(frame, [0, self.n_frame_len - len(frame)], 'constant')
-        unmerged = self._decode(frame, self.offset)
-        if not merge:
-            return unmerged
-        return self.greedy_merge(unmerged)
-    
-    def reset(self):
-        '''
-        Reset frame_history and decoder's state
-        '''
-        self.buffer=np.zeros(shape=self.buffer.shape, dtype=np.float32)
-        self.prev_char = ''
 
-    @staticmethod
-    def _greedy_decoder(logits, vocab):
-        s = ''
-        for i in range(logits.shape[0]):
-            s += vocab[np.argmax(logits[i])]
-        return s
-
-    def greedy_merge(self, s):
-        s_merged = ''
-        
-        for i in range(len(s)):
-            if s[i] != self.prev_char:
-                self.prev_char = s[i]
-                if self.prev_char != '_':
-                    s_merged += self.prev_char
-        return s_merged
     
-def main():
-    service = ASRService()
-    service.start_stream()
 
+# New main block with argparse and demo-file support
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="ASRService Utility")
+    parser.add_argument('--demo-file', '-f', type=str,
+                        help="Raw PCM file for streaming demo (16kHz, 16-bit, mono)")
+    args = parser.parse_args()
+
+    # Use default values for frame_len, frame_overlap, offset, model_path
+    service = ASRService(
+        frame_len=2.0,
+        frame_overlap=2.5,
+        offset=4,
+        model_path='./quartznet_jp/japanese-quartznet-large.nemo'
+    )
+
+    if args.demo_file:
+        # File-based streaming demo
+        import numpy as np, time
+        # Load raw samples from WAV or raw PCM
+        if args.demo_file.lower().endswith('.wav'):
+            try:
+                with wave.open(args.demo_file, 'rb') as wf:
+                    # Ensure format matches: mono, expected sample rate
+                    assert wf.getnchannels() == 1, "WAV must be mono"
+                    assert wf.getframerate() == service.sample_rate, f"WAV sample rate must be {service.sample_rate}"
+                    frames = wf.readframes(wf.getnframes())
+                # inside event_generator, instead of hardcoded int16:
+                # if s16le read with np.int16 if s32le read with np.float32
+                # Convert to numpy array
+                raw = np.frombuffer(frames, dtype=np.int16)
+            except wave.Error:
+                # Fallback for non-PCM WAV (e.g., float32)
+                data, fs = sf.read(args.demo_file, dtype='int16')
+                assert fs == service.sample_rate, f"WAV sample rate must be {service.sample_rate}"
+                # data is shape (N,) or (N,1)
+                raw = data.flatten().astype(np.int16)
+        else:
+            # assume raw PCM file
+            raw = np.fromfile(args.demo_file, dtype=np.int16)
+        n = service.asr.n_frame_len
+        sr = service.sample_rate
+        for i in range(0, len(raw), n):
+            frame = raw[i:i+n].astype(np.float32) / 32768.0
+            import pdb; pdb.set_trace()
+            if frame.shape[0] < n:
+                frame = np.pad(frame, (0, n - frame.shape[0]), 'constant')
+            # Debug logging
+            logging.debug(f"[DEMO] Processing raw samples indices {i}:{i+n}")
+            logging.debug(f"[DEMO] Frame dtype: {frame.dtype}, shape: {frame.shape}, mean: {frame.mean():.6f}, std: {frame.std():.6f}")
+            # Get unmerged and merged transcriptions
+            unmerged = service.asr.transcribe(frame, merge=False)
+            merged = service.asr.transcribe(frame, merge=True)
+            logging.debug(f"[DEMO] Unmerged: '{unmerged}'")
+            logging.debug(f"[DEMO] Merged:   '{merged}'")
+            print(f"[DEMO][FRAME {i//n}] {merged}", flush=True)
+            time.sleep(n / sr)
+    else:
+        # Microphone streaming
+        service.start_stream()

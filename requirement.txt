@@ -1,0 +1,6 @@
+numpy>=1.26.4
+PyAudio>=0.2.14
+torch>=2.7.0
+nemo_toolkit[all]>=2.3.1
+omegaconf>=2.3.0
+sseclient
